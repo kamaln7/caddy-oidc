@@ -670,3 +670,43 @@ func TestSessionCookieAuthenticator_SessionBoundToClaimSelection(t *testing.T) {
 	_, err = rich.AuthenticateRequest(&cfg, r)
 	require.ErrorIs(t, err, ErrNoAuthentication)
 }
+
+func TestSessionCookieAuthenticator_SameSite(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		sameSite SameSite
+		want     http.SameSite
+	}{
+		{"unset defaults to lax", SameSiteDefault, http.SameSiteLaxMode},
+		{"lax", SameSiteLax, http.SameSiteLaxMode},
+		{"strict is kept", SameSiteStrict, http.SameSiteStrictMode},
+		{"none is kept", SameSiteNone, http.SameSiteNoneMode},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			au := &SessionCookieAuthenticator{
+				Name:     "test-cookie",
+				Secret:   "Y4lbVNr01M4NyBCUSNbrAL4cavA6kjdM",
+				SameSite: tc.sameSite,
+			}
+
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+			defer cancel()
+
+			require.NoError(t, au.Provision(ctx))
+
+			assert.Equal(t, tc.want, au.NewCookie("value").SameSite)
+
+			// The CSRF/state cookie issued at login start carries the same attribute.
+			w := httptest.NewRecorder()
+			require.NoError(t, au.StartLogin(&testHandleCallbackConfiguration{}, w, pkgtest.NewRequest(http.MethodGet, "/", nil)))
+
+			cookies := w.Result().Cookies()
+			require.Len(t, cookies, 1)
+			assert.Equal(t, tc.want, cookies[0].SameSite)
+		})
+	}
+}

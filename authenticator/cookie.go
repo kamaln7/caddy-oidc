@@ -52,18 +52,18 @@ type OAuthAuthorizationFlowConfiguration interface {
 // ENUM(lax, strict, none, default = "")
 type SameSite string
 
+// HTTPSameSite returns the net/http mode. An unset value defaults to Lax (audit F-03): omitting the
+// attribute lets Firefox/Safari send the session cookie on cross-site POSTs, and Chromium for ~2 minutes.
 func (ss SameSite) HTTPSameSite() http.SameSite {
 	switch ss {
-	case SameSiteLax:
-		return http.SameSiteLaxMode
 	case SameSiteStrict:
 		return http.SameSiteStrictMode
 	case SameSiteNone:
 		return http.SameSiteNoneMode
-	case SameSiteDefault:
-		return http.SameSiteDefaultMode
+	case SameSiteLax, SameSiteDefault:
+		return http.SameSiteLaxMode
 	default:
-		return http.SameSiteDefaultMode
+		return http.SameSiteLaxMode
 	}
 }
 
