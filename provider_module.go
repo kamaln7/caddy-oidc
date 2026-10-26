@@ -193,7 +193,8 @@ func (m *OIDCProviderModule) Validate() error {
 func (m *OIDCProviderModule) setupHTTPClient(log *zap.Logger) *http.Client {
 	retryClient := retryablehttp.NewClient()
 	retryClient.Logger = slog.New(zapslog.NewHandler(log.Core(), zapslog.WithName(log.Name()), zapslog.WithCaller(false)))
-	retryClient.RetryMax = 5
+	retryClient.RetryMax = 2
+	retryClient.RetryWaitMax = 2 * time.Second
 
 	// Copy the default settings from HTTP DefaultTransport
 	//nolint:forcetypeassert
@@ -208,6 +209,7 @@ func (m *OIDCProviderModule) setupHTTPClient(log *zap.Logger) *http.Client {
 
 	retryClient.HTTPClient = &http.Client{
 		Transport: retryClientTransport,
+		Timeout:   10 * time.Second,
 	}
 
 	return retryClient.StandardClient()
@@ -230,6 +232,9 @@ func (m *OIDCProviderModule) Create(ctx caddy.Context) (*Provider, error) {
 
 				provider, err := oidc.NewProvider(providerCtx, m.Issuer)
 				if err != nil {
+					// Failed discovery is retried on a later request (see deferred.RetryAfter); make it visible now.
+					log.Error("OIDC provider discovery failed, will retry on demand", zap.String("issuer", m.Issuer), zap.Error(err))
+
 					return nil, fmt.Errorf("oidc discovery failed: %w", err)
 				}
 
