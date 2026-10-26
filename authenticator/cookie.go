@@ -2,12 +2,15 @@ package authenticator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -152,6 +155,10 @@ type SessionCookieAuthenticator struct {
 
 	secure      *securecookie.SecureCookie
 	redirectURL *url.URL
+	// sessionName is the securecookie "name" (MAC/AES context) for session cookies. It is derived from
+	// the cookie name AND the claim selection, so a cookie minted under one claim set is not valid
+	// under another (otherwise deny-by-claim rules can be bypassed by replaying a poorer session).
+	sessionName string
 }
 
 func (*SessionCookieAuthenticator) CaddyModule() caddy.ModuleInfo {
@@ -302,6 +309,9 @@ func (au *SessionCookieAuthenticator) Provision(_ caddy.Context) error {
 	// as we will validate the session expiration time as part of the session payload.
 	au.secure.MaxAge(0)
 
+	fp := sha256.Sum256([]byte(strings.Join(au.Claims, ",") + "|" + strings.Join(au.IDClaims, ",")))
+	au.sessionName = au.Name + "|s|" + hex.EncodeToString(fp[:6])
+
 	if au.RedirectURL == "" {
 		au.RedirectURL = defaultRedirectURL
 	}
@@ -345,7 +355,7 @@ func (au *SessionCookieAuthenticator) AuthenticateRequest(cfg OIDCConfiguration,
 
 	var s session.Session
 
-	err = au.secure.Decode(au.Name, cookiePlain.Value, &s)
+	err = au.secure.Decode(au.sessionName, cookiePlain.Value, &s)
 	if err != nil {
 		// Expired or foreign-signed cookie, treat as unauthenticated
 		return nil, caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("%w: %w", ErrNoAuthentication, err))
@@ -377,6 +387,19 @@ func (au *SessionCookieAuthenticator) NewCookie(value string) *http.Cookie {
 	return cookie
 }
 
+// localRedirectTarget returns the post-login return path as a same-origin, path-absolute reference.
+// It is built from the parsed URL (never the raw request-target) and any run of leading
+// slashes/backslashes is collapsed to a single "/", so the result cannot be read by a browser
+// as a scheme-relative ("//host") or backslash ("/\\host") URL, nor as an absolute-form URL.
+func localRedirectTarget(r *http.Request) string {
+	p := "/" + strings.TrimLeft(r.URL.EscapedPath(), `/\`)
+	if r.URL.RawQuery != "" {
+		p += "?" + r.URL.RawQuery
+	}
+
+	return p
+}
+
 // CSRFToken is the CSRF cookie payload when perform an OAuth2 Authorization Flow.
 type CSRFToken struct {
 	PKCEVerifier string `json:"v"`
@@ -400,7 +423,7 @@ func (au *SessionCookieAuthenticator) StartLogin(cfg OAuthAuthorizationFlowConfi
 		state             = uuid.New().String()
 		pkceVerifier      = oauth2.GenerateVerifier()
 		csrfCookieName    = fmt.Sprintf("%s|%s", au.Name, state)
-		csrfCookiePayload = &CSRFToken{PKCEVerifier: pkceVerifier, RedirectURI: r.RequestURI}
+		csrfCookiePayload = &CSRFToken{PKCEVerifier: pkceVerifier, RedirectURI: localRedirectTarget(r)}
 	)
 
 	csrfCookieValue, err := au.secure.Encode(csrfCookieName, csrfCookiePayload)
@@ -549,7 +572,7 @@ func (au *SessionCookieAuthenticator) HandleCallback(cfg OAuthAuthorizationFlowC
 		return caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
-	cookieValue, err := au.secure.Encode(au.Name, s)
+	cookieValue, err := au.secure.Encode(au.sessionName, s)
 	if err != nil {
 		return fmt.Errorf("failed to encode session cookie: %w", err)
 	}
@@ -558,7 +581,9 @@ func (au *SessionCookieAuthenticator) HandleCallback(cfg OAuthAuthorizationFlowC
 
 	// Redirect to the configured redirect URI
 	var redirectURI = csrfToken.RedirectURI
-	if redirectURI == "" {
+	// The state cookie is MAC'd, but enforce a same-origin path-absolute target again at use so a
+	// "//host" or "/\host" value can never reach http.Redirect verbatim.
+	if !strings.HasPrefix(redirectURI, "/") || strings.HasPrefix(redirectURI, "//") || strings.HasPrefix(redirectURI, `/\`) {
 		redirectURI = "/" // Fall back to root
 	}
 
