@@ -172,7 +172,7 @@ func TestSessionCookieAuthenticator_AuthenticateRequest_WithCookie(t *testing.T)
 	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
 
 	s := &session.Session{UID: "test"}
-	cookieValue, err := au.secure.Encode(au.Name, s)
+	cookieValue, err := au.secure.Encode(au.sessionName, s)
 	require.NoError(t, err)
 
 	r.AddCookie(au.NewCookie(cookieValue))
@@ -205,7 +205,7 @@ func TestSessionCookieAuthenticator_AuthenticateRequest_WithCookieSignedByOther(
 	s := &session.Session{UID: "test"}
 	cookieSigner := securecookie.New([]byte("EPb6FR6Uehz2uWdfhtb7l6c4tXzgMJT8"), []byte("EPb6FR6Uehz2uWdfhtb7l6c4tXzgMJT8"))
 
-	cookie, err := cookieSigner.Encode(au.Name, s)
+	cookie, err := cookieSigner.Encode(au.sessionName, s)
 	require.NoError(t, err)
 
 	r.AddCookie(au.NewCookie(cookie))
@@ -237,7 +237,7 @@ func TestSessionCookieAuthenticator_AuthenticateRequest_CookiePastSecureCookieMa
 	err := au.Provision(ctx)
 	require.NoError(t, err)
 
-	cookieValue, err := au.secure.Encode(au.Name, &session.Session{UID: "test"})
+	cookieValue, err := au.secure.Encode(au.sessionName, &session.Session{UID: "test"})
 	require.NoError(t, err)
 
 	// Any timestamp is now past max age
@@ -276,7 +276,7 @@ func TestSessionCookieAuthenticator_AuthenticateRequest_SessionExpired(t *testin
 	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
 
 	s := &session.Session{UID: "test", ExpiresAt: cfg.Now().Add(-time.Hour).Unix()}
-	cookieValue, err := au.secure.Encode(au.Name, s)
+	cookieValue, err := au.secure.Encode(au.sessionName, s)
 	require.NoError(t, err)
 
 	r.AddCookie(au.NewCookie(cookieValue))
@@ -305,7 +305,7 @@ func TestSessionCookieAuthenticator_Provision_64ByteSecret(t *testing.T) {
 	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
 
 	s := &session.Session{UID: "test"}
-	cookieValue, err := au.secure.Encode(au.Name, s)
+	cookieValue, err := au.secure.Encode(au.sessionName, s)
 	require.NoError(t, err)
 
 	r.AddCookie(au.NewCookie(cookieValue))
@@ -445,7 +445,7 @@ func TestSessionCookieAuthenticator_HandleCallback_CopiesClaimsAsRawJSON(t *test
 
 	var s session.Session
 
-	err = au.secure.Decode(au.Name, sessionCookie.Value, &s)
+	err = au.secure.Decode(au.sessionName, sessionCookie.Value, &s)
 	require.NoError(t, err)
 
 	assert.Equal(t, "admin", s.UID)
@@ -523,7 +523,7 @@ func TestSessionCookieAuthenticator_HandleCallback_MaxAge(t *testing.T) {
 
 	var s session.Session
 
-	err = au.secure.Decode(au.Name, sessionCookie.Value, &s)
+	err = au.secure.Decode(au.sessionName, sessionCookie.Value, &s)
 	require.NoError(t, err)
 
 	assert.Equal(t, "user-1", s.UID)
@@ -544,4 +544,129 @@ func TestSessionCookieAuthenticator_NewCookie_MaxAge(t *testing.T) {
 	au.MaxAge = 0
 	c = au.NewCookie("value")
 	assert.Equal(t, 0, c.MaxAge)
+}
+
+func TestLocalRedirectTarget(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, requestURI, want string
+	}{
+		{"plain path", "/app/page?x=1", "/app/page?x=1"},
+		{"root", "/", "/"},
+		{"scheme-relative", "//evil.example/phish?x=1", "/evil.example/phish?x=1"},
+		{"many slashes", "////evil.example", "/evil.example"},
+		{"backslash", `/\evil.example`, "/%5Cevil.example"},
+		{"encoded slashes stay on origin", "/%2F%2Fevil.example", "/%2F%2Fevil.example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := pkgtest.NewRequest(http.MethodGet, tc.requestURI, nil)
+			r.RequestURI = tc.requestURI
+
+			assert.Equal(t, tc.want, localRedirectTarget(r))
+		})
+	}
+}
+
+func TestSessionCookieAuthenticator_HandleCallback_RejectsOffOriginRedirect(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{"//evil.example/x", `/\evil.example`, "https://evil.example/", "evil.example"} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+
+			au := &SessionCookieAuthenticator{
+				Name:   "test-cookie",
+				Secret: "Y4lbVNr01M4NyBCUSNbrAL4cavA6kjdM",
+			}
+
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+			defer cancel()
+
+			require.NoError(t, au.Provision(ctx))
+
+			const state = "test-state"
+
+			csrfCookieValue, err := au.secure.Encode(au.Name+"|"+state, &CSRFToken{PKCEVerifier: "v", RedirectURI: target})
+			require.NoError(t, err)
+
+			r := pkgtest.NewRequest(http.MethodGet, "/oauth2/callback?state="+state+"&code=test-code", nil)
+			csrfCookie := au.NewCookie(csrfCookieValue)
+			csrfCookie.Name = au.Name + "|" + state
+			r.AddCookie(csrfCookie)
+
+			cfg := &testHandleCallbackConfiguration{
+				TestOIDCConfiguration: pkgtest.TestOIDCConfiguration{UsernameClaim: "preferred_username"},
+				userInfo:              newTestUserInfo(t, `{"preferred_username": "admin"}`),
+				expires:               time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+			}
+
+			w := httptest.NewRecorder()
+			require.NoError(t, au.HandleCallback(cfg, w, r))
+			assert.Equal(t, "/", w.Header().Get("Location"))
+		})
+	}
+}
+
+func TestSessionCookieAuthenticator_StartLogin_StoresLocalRedirectTarget(t *testing.T) {
+	t.Parallel()
+
+	au := &SessionCookieAuthenticator{
+		Name:   "test-cookie",
+		Secret: "Y4lbVNr01M4NyBCUSNbrAL4cavA6kjdM",
+	}
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	require.NoError(t, au.Provision(ctx))
+
+	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
+	r.RequestURI = "//evil.example/x"
+	r.URL.Path = "//evil.example/x"
+
+	w := httptest.NewRecorder()
+	require.NoError(t, au.StartLogin(&testHandleCallbackConfiguration{}, w, r))
+
+	cookies := w.Result().Cookies()
+	require.Len(t, cookies, 1)
+
+	var token CSRFToken
+
+	require.NoError(t, au.secure.Decode(cookies[0].Name, cookies[0].Value, &token))
+	assert.Equal(t, "/evil.example/x", token.RedirectURI)
+}
+
+func TestSessionCookieAuthenticator_SessionBoundToClaimSelection(t *testing.T) {
+	t.Parallel()
+
+	const secret = "Y4lbVNr01M4NyBCUSNbrAL4cavA6kjdM"
+
+	provision := func(claims ...string) *SessionCookieAuthenticator {
+		au := &SessionCookieAuthenticator{Name: "shared", Secret: secret, Claims: claims}
+
+		ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+		t.Cleanup(cancel)
+		require.NoError(t, au.Provision(ctx))
+
+		return au
+	}
+
+	poor, rich := provision("email"), provision("email", "groups")
+
+	cookieValue, err := poor.secure.Encode(poor.sessionName, &session.Session{UID: "test"})
+	require.NoError(t, err)
+
+	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
+	r.AddCookie(poor.NewCookie(cookieValue))
+
+	var cfg pkgtest.TestOIDCConfiguration
+
+	_, err = poor.AuthenticateRequest(&cfg, r)
+	require.NoError(t, err)
+
+	_, err = rich.AuthenticateRequest(&cfg, r)
+	require.ErrorIs(t, err, ErrNoAuthentication)
 }
